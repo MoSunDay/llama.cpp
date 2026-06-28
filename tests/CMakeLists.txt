@@ -305,6 +305,9 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 # server_kv_arena: header-only, self-contained prompt-cache arena unit test
 llama_build_and_test(test-cache-arena.cpp)
 
+# server_radix_index: header-only template, self-contained prompt-cache trie unit test
+llama_build_and_test(test-cache-radix.cpp)
+
 llama_build(export-graph-ops.cpp)
 target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)

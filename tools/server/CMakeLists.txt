@@ -6,7 +6,6 @@ set(TARGET server-context)
 
 add_library(${TARGET} STATIC
     server-cache-arena.h
-    server-cache-radix.cpp
     server-cache-radix.h
     server-chat.cpp
     server-chat.h
