@@ -5,6 +5,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
+    server-cache-arena.h
+    server-cache-radix.cpp
+    server-cache-radix.h
     server-chat.cpp
     server-chat.h
     server-task.cpp

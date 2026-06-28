@@ -10,6 +10,8 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-cache-arena.h"
+#include "server-cache-radix.h"
 
 using json = nlohmann::ordered_json;
 
@@ -581,11 +583,16 @@ struct server_task_result_apply_lora : server_task_result {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    // non-owning views into the cache arena (server_kv_arena). Null/zero for
+    // transient prompts (e.g. a slot's live prompt, whose KV lives in the
+    // llama_context rather than a serialized blob).
+    uint8_t * main      = nullptr;
+    size_t    main_size = 0;
+    uint8_t * drft      = nullptr;
+    size_t    drft_size = 0;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main_size + drft_size;
     }
 };
 
@@ -619,15 +626,37 @@ struct server_prompt {
             checkpoints,
         };
     }
+
+    // cache-internal LRU access timestamp (monotonic tick); ignored by transient
+    // (slot) prompts. Only meaningful for entries living in server_prompt_cache.
+    uint64_t last_access = 0;
 };
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+        size_t cap;
+        if (limit_size_mib < 0) {
+            // "unlimited": pick a large virtual cap (demand-paged, so RSS only
+            // grows with use). alloc() still evicts LRU when this cap fills.
+            cap = 16ull * 1024 * 1024 * 1024;
+            this->limit_size = 0; // 0 = no byte-limit eviction in update() (legacy)
+        } else {
+            cap = (size_t) 1024 * 1024 * limit_size_mib;
+            this->limit_size = cap;
+        }
         this->limit_tokens = limit_tokens;
+        // single contiguous reservation for all cached blobs (no fragmentation);
+        // pages commit lazily, so RSS grows with actual use, bounded by the cap
+        arena_.resize(cap);
+        ready_ = arena_.ready();
+        // the arena may have shrunk below the requested cap under restrictive
+        // overcommit - keep the eviction threshold consistent with real capacity
+        if (this->limit_size > arena_.capacity()) {
+            this->limit_size = arena_.capacity();
+        }
     }
 
-    std::list<server_prompt> states;
+    std::list<server_prompt> states;   // back = most-recently-used, front = LRU
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -644,6 +673,18 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
+
+private:
+    server_kv_arena    arena_;   // contiguous, free-list blob storage
+    server_radix_index radix_;   // O(prefix) longest-common-prefix lookup
+    bool               ready_ = false;
+    uint64_t           tick_  = 0;   // monotonic LRU access counter
+
+    // free an entry's arena slices + drop it from the radix index (list untouched)
+    void release_blob(server_prompt & e);
+
+    // find the least-recently-used entry, release it and erase it from the list
+    void evict_one();
 };
 
 // used exclusively by router mode

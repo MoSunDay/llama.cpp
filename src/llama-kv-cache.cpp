@@ -1149,6 +1149,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
+                seq_touch(ubatch.seq_id[i][s]);
             }
         }
     }
@@ -1179,6 +1180,44 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+llama_seq_id llama_kv_cache::get_lru_evictable_seq(const llama_seq_id * keep, size_t n_keep) const {
+    llama_seq_id best = -1;
+    uint64_t     best_t = std::numeric_limits<uint64_t>::max();
+
+    for (int32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        // skip sequences with no cells in any stream
+        bool has_cells = false;
+        for (const auto & cells : v_cells) {
+            if (cells.seq_pos_min(s) >= 0) {
+                has_cells = true;
+                break;
+            }
+        }
+        if (!has_cells) {
+            continue;
+        }
+
+        // skip protected (active) sequences
+        bool is_protected = false;
+        for (size_t k = 0; k < n_keep; ++k) {
+            if (keep[k] == s) {
+                is_protected = true;
+                break;
+            }
+        }
+        if (is_protected) {
+            continue;
+        }
+
+        if (seq_last_use_[s] < best_t) {
+            best_t = seq_last_use_[s];
+            best   = s;
+        }
+    }
+
+    return best;
 }
 
 bool llama_kv_cache::get_can_shift() const {

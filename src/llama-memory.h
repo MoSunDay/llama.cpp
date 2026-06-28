@@ -116,6 +116,13 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // LRU eviction helper (Workstream C): return the least-recently-used sequence
+    // that has cells and is not in `keep`, or -1 if none. Default: unsupported.
+    // Read-only. The caller performs the actual removal via seq_rm.
+    virtual llama_seq_id get_lru_evictable_seq(const llama_seq_id * /*keep*/, size_t /*n_keep*/) const {
+        return -1;
+    }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

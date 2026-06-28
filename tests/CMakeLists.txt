@@ -302,6 +302,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# server_kv_arena: header-only, self-contained prompt-cache arena unit test
+llama_build_and_test(test-cache-arena.cpp)
+
 llama_build(export-graph-ops.cpp)
 target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)

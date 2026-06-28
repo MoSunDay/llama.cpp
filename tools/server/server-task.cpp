@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <climits>
+#include <algorithm>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1621,146 +1624,202 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+    if (!ready_) {
+        return nullptr;
+    }
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+    // skip if an identical prompt is already cached (full token sequence match)
+    {
+        int lcp = 0;
+        auto * existing = radix_.longest_prefix(prompt.tokens, (int) prompt.tokens.size(), lcp);
+        if (existing != nullptr && lcp == (int) prompt.tokens.size() && existing->n_tokens() == (int) prompt.tokens.size()) {
             SRV_INF("%s", " - prompt is already in the cache, skipping\n");
+            existing->last_access = ++tick_;
             return nullptr;
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
+    // remove any cached prompts fully contained in the new one (obsolete)
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->tokens.size()) {
+        if (len == (int) it->tokens.size() && it->n_tokens() <= (int) prompt.tokens.size()) {
             SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
+            release_blob(*it);
             it = states.erase(it);
         } else {
             ++it;
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    // allocate arena slices for the serialized state, evicting LRU entries on demand
+    size_t off_tgt = 0;
+    size_t off_dft = 0;
+    while (true) {
+        off_tgt = (state_size_tgt > 0) ? arena_.alloc(state_size_tgt) : 0;
+        off_dft = (state_size_dft > 0) ? arena_.alloc(state_size_dft) : 0;
 
-    // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+        const bool ok_tgt = (state_size_tgt == 0) || (off_tgt != SIZE_MAX);
+        const bool ok_dft = (state_size_dft == 0) || (off_dft != SIZE_MAX);
+        if (ok_tgt && ok_dft) {
+            break;
+        }
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+        // roll back any partial allocation
+        if (state_size_tgt > 0 && off_tgt != SIZE_MAX) {
+            arena_.free(off_tgt, state_size_tgt);
+        }
+        if (state_size_dft > 0 && off_dft != SIZE_MAX) {
+            arena_.free(off_dft, state_size_dft);
+        }
 
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+        if (states.empty()) {
+            SRV_ERR("%s", "failed to allocate arena slices for prompt cache state (entry larger than cache?)\n");
+            return nullptr;
+        }
 
-        update();
-
-        return nullptr;
+        SRV_WRN("%s", " - cache full, evicting LRU entry to make room\n");
+        evict_one();
     }
+
+    uint8_t * base = arena_.data(0);
 
     states.push_back({
         /*.tokens      =*/ prompt.tokens.clone(),
         /*.data        =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
+            /*.main      =*/ (state_size_tgt > 0 ? base + off_tgt : nullptr),
+            /*.main_size =*/ state_size_tgt,
+            /*.drft      =*/ (state_size_dft > 0 ? base + off_dft : nullptr),
+            /*.drft_size =*/ state_size_dft,
         },
         /*.checkpoints =*/ prompt.checkpoints,
     });
 
-    return &states.back();
+    server_prompt * cur = &states.back();
+    cur->last_access = ++tick_;
+    radix_.insert(cur->tokens, cur);
+
+    return cur;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    if (!ready_) {
+        return true;
+    }
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    const int qsize = (int) tokens_new.size();
+
+    // base keep/sim from the slot's currently-held prompt
+    const int lcp_slot = prompt.tokens.get_common_prefix(tokens_new);
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_slot) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float sim_best    = qsize > 0 ? float(lcp_slot) / qsize : 0.0f;
 
     SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-    auto it_best = states.end();
+    // O(prefix) longest-common-prefix lookup via the radix index (replaces the
+    // legacy O(N*L) linear scan)
+    int lcp = 0;
+    server_prompt * best = radix_.longest_prefix(tokens_new, qsize, lcp);
 
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+    if (best != nullptr) {
+        const float f_keep_cur = best->n_tokens() > 0 ? float(lcp) / best->n_tokens() : 1.0f;
+        const float sim_cur    = qsize > 0 ? float(lcp) / qsize : 0.0f;
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        // don't trash large prompts, and require a strict improvement (legacy heuristic)
+        if (f_keep_cur >= 0.25f && (f_keep_best < f_keep_cur && sim_best < sim_cur)) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
 
-            it_best = it;
-        }
-    }
+            SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-    if (it_best != states.end()) {
-        SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+            // restore the cached state into the slot's sequence. The blob is read-only
+            // and shared: we do NOT consume/erase the cache entry (true LRU - the same
+            // cached prefix can serve many concurrent requests).
+            {
+                const size_t size = best->data.main_size;
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, best->data.main, size, id_slot, 0);
+                if (n != size) {
+                    SRV_ERR("failed to restore state with size %zu\n", size);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
+                    return false;
+                }
             }
 
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
+            if (best->data.drft_size > 0) {
                 GGML_ASSERT(ctx_dft);
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                const size_t size = best->data.drft_size;
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, best->data.drft, size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
+
+            // give the slot the cached prompt's tokens (COPY - the cache entry stays)
+            prompt.tokens      = best->tokens.clone();
+            prompt.checkpoints = best->checkpoints;
+
+            // mark accessed (LRU)
+            best->last_access = ++tick_;
         }
-
-        prompt = std::move(*it_best);
-
-        states.erase(it_best);
     }
 
     return true;
 }
 
+void server_prompt_cache::release_blob(server_prompt & e) {
+    if (!ready_) {
+        return;
+    }
+
+    const uint8_t * base = arena_.data(0);
+
+    if (e.data.main_size > 0 && e.data.main != nullptr) {
+        arena_.free((size_t)(e.data.main - base), e.data.main_size);
+        e.data.main      = nullptr;
+        e.data.main_size = 0;
+    }
+    if (e.data.drft_size > 0 && e.data.drft != nullptr) {
+        arena_.free((size_t)(e.data.drft - base), e.data.drft_size);
+        e.data.drft      = nullptr;
+        e.data.drft_size = 0;
+    }
+
+    radix_.erase(e.tokens, &e);
+}
+
+void server_prompt_cache::evict_one() {
+    if (states.empty()) {
+        return;
+    }
+
+    // find the least-recently-used entry (smallest last_access tick)
+    auto it_min = states.begin();
+    for (auto it = std::next(states.begin()); it != states.end(); ++it) {
+        if (it->last_access < it_min->last_access) {
+            it_min = it;
+        }
+    }
+
+    SRV_WRN(" - evicting LRU prompt with %d tokens (%.3f MiB)\n",
+            it_min->n_tokens(), it_min->size() / (1024.0 * 1024.0));
+
+    release_blob(*it_min);
+    states.erase(it_min);
+}
+
 void server_prompt_cache::update() {
+    if (!ready_) {
+        return;
+    }
+
+    // evict by LRU until within the byte limit
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
         while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1768,23 +1827,18 @@ void server_prompt_cache::update() {
     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, (size_t)(limit_size / size_per_token)) : limit_tokens;
 
     if (limit_tokens > 0) {
         while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 
-    SRV_INF(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_INF(" - cache state: %zu prompts, %.3f MiB (arena %.3f/%.3f MiB used) (limits: %.3f MiB, %zu tokens, %zu est)\n",
+            states.size(), size() / (1024.0 * 1024.0),
+            arena_.used() / (1024.0 * 1024.0), arena_.capacity() / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

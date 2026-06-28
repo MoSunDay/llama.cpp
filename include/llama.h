@@ -774,6 +774,19 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Returns the least-recently-used sequence id that currently occupies memory
+    // (KV cells) and is NOT listed in `keep` (the active/protected sequences, e.g.
+    // the slots currently generating). Returns -1 if no evictable sequence exists.
+    //
+    // This is a read-only helper for cross-sequence LRU eviction (Workstream C):
+    // the caller decides when to evict and performs the actual removal via
+    // llama_memory_seq_rm(). Sequences are marked used as the cache processes
+    // batches. Memory types that do not support this lookup return -1.
+    LLAMA_API llama_seq_id llama_memory_get_lru_seq(
+            llama_memory_t          mem,
+            const llama_seq_id    * keep,
+            size_t                  n_keep);
+
     //
     // State / sessions
     //

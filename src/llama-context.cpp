@@ -3921,6 +3921,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+llama_seq_id llama_memory_get_lru_seq(llama_memory_t mem, const llama_seq_id * keep, size_t n_keep) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->get_lru_evictable_seq(keep, n_keep);
+}
+
 // llama state API
 
 // deprecated

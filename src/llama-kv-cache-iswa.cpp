@@ -127,6 +127,12 @@ llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
 }
 
+llama_seq_id llama_kv_cache_iswa::get_lru_evictable_seq(const llama_seq_id * keep, size_t n_keep) const {
+    // the base cache is a superset of the SWA cache, so the base cache is
+    // authoritative for "which sequences currently occupy cells"
+    return kv_base->get_lru_evictable_seq(keep, n_keep);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown();
     for (const auto & buft_size : kv_swa->memory_breakdown()) {

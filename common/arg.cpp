@@ -1478,6 +1478,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-evict-lru"},
+        {"--no-kv-evict-lru"},
+        "enable cross-sequence LRU KV eviction: expose the least-recently-used idle sequence so it can be evicted to make room for active sequences (default: disabled, additive)",
+        [](common_params & params, bool value) {
+            params.kv_evict_lru = value;
+        }
+    ).set_env("LLAMA_ARG_KV_EVICT_LRU").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

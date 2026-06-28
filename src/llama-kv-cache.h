@@ -142,6 +142,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    llama_seq_id get_lru_evictable_seq(const llama_seq_id * keep, size_t n_keep) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
@@ -192,6 +194,16 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+
+    // ---- LRU eviction support (Workstream C) ---------------------------------
+    // Mark a sequence as recently used (monotonic tick). Called from apply_ubatch
+    // when cells are assigned to a sequence. Additive: only feeds the getter below.
+    void seq_touch(llama_seq_id seq_id) {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) LLAMA_MAX_SEQ) {
+            seq_last_use_[seq_id] = ++lru_tick_;
+        }
+    }
+    // (get_lru_evictable_seq is declared with the llama_memory_i overrides below)
 
     //
     // input API
@@ -278,6 +290,11 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // per-sequence last-use tick for LRU eviction (Workstream C). Additive: zero
+    // by default; only read by get_lru_evictable_seq(). Does not affect allocation.
+    uint64_t seq_last_use_[LLAMA_MAX_SEQ] = {};
+    uint64_t lru_tick_ = 0;
 
     std::vector<kv_layer> layers;
 

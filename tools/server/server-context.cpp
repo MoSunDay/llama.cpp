@@ -236,9 +236,9 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main, cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
         return true;
@@ -1671,6 +1671,24 @@ private:
                 prompt_cache->update();
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // Workstream C (additive, gated, default-off): identify the
+            // least-recently-used idle sequence in the shared KV cache so an
+            // operator (or a future eviction policy) can free its cells without
+            // touching the active/protected slots. Pure observability here -
+            // actual idle-slot clearing is still driven by --cache-idle-slots.
+            if (params_base.kv_evict_lru) {
+                std::vector<llama_seq_id> keep;
+                for (const auto & s : slots) {
+                    if (s.is_processing()) {
+                        keep.push_back(s.id);
+                    }
+                }
+                const llama_seq_id lru = llama_memory_get_lru_seq(llama_get_memory(ctx_tgt), keep.data(), keep.size());
+                if (lru >= 0) {
+                    SRV_INF("kv-evict-lru: LRU evictable sequence = %d (active slots protected: %zu)\n", lru, keep.size());
+                }
             }
         }
 
